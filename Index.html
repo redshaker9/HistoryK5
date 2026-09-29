@@ -1,0 +1,1391 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>เกมประวัติศาสตร์ ร.๕ (AR Hand & Head Tracking)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- เปลี่ยนจาก MediaPipe Hands มาใช้ MediaPipe Pose เพื่อจับทั้งหัวและมือ -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body {
+            font-family: 'Sarabun', sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #2c1e16;
+            background-image: url('https://www.transparenttextures.com/patterns/aged-paper.png');
+            color: #3e2723;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+
+        #game-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            max-width: 1280px;
+            max-height: 720px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+            background-color: #f4e4bc;
+            border: 8px solid #8b6508;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        #game-canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+
+        /* ซ่อนกล้องไปเลย เพราะเราจะวาดกล้องลงบน Canvas โดยตรง */
+        #webcam-video {
+            display: none; 
+        }
+
+        #status-message {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #fff;
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 14px;
+            z-index: 20;
+            display: none;
+        }
+        
+        #error-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.9);
+            color: red;
+            display: none;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+            text-align: center;
+            padding: 20px;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <canvas id="game-canvas"></canvas>
+    <video id="webcam-video" autoplay playsinline></video>
+    <div id="status-message">กำลังโหลดระบบ AI Tracking...</div>
+    
+    <div id="error-overlay">
+        <h2 class="text-3xl font-bold mb-4">ไม่สามารถเข้าถึงกล้องได้</h2>
+        <p class="text-xl text-white">กรุณาอนุญาตการใช้งานกล้อง (Webcam) เพื่อเล่นเกม AR นี้</p>
+        <button onclick="location.reload()" class="mt-6 px-6 py-2 bg-yellow-600 text-white rounded hover:bg-yellow-700">ลองใหม่อีกครั้ง</button>
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById('game-canvas');
+    const ctx = canvas.getContext('2d');
+    const videoElement = document.getElementById('webcam-video');
+    const statusMsg = document.getElementById('status-message');
+    const errorOverlay = document.getElementById('error-overlay');
+
+    let CANVAS_WIDTH = 1280;
+    let CANVAS_HEIGHT = 720;
+    
+    const STATE_START = 0;
+    const STATE_MODE_SELECT = 1;
+    const STATE_MISSIONS = 2;
+    const STATE_HATS = 3;
+    const STATE_AR_GAME = 4;
+    const STATE_SUMMARY = 5;
+    let currentState = STATE_START;
+
+    // โหมดการเล่น: 'AR' (เปิดกล้องจับหัว/มือ) หรือ 'NORMAL' (เลื่อนรถเข็นด้วยเมาส์/ปุ่มลูกศร)
+    let gameMode = 'AR';
+
+    // Tracking Variables (Head + Both Hands) - ใช้เฉพาะตอนเล่นโหมด AR
+    let isPersonPresent = false;
+    let headPos = {x: -100, y: -100, active: false};
+    let leftHandPos = {x: -100, y: -100, active: false};
+    let rightHandPos = {x: -100, y: -100, active: false};
+    
+    // Main cursor for menus (เมาส์ หรือมือขวาถ้าเปิดกล้อง)
+    let cursorX = -100;
+    let cursorY = -100;
+
+    let hoverTarget = null;
+    let hoverStartTime = 0;
+    const HOVER_DURATION = 2000; // โหมด AR: ชี้ค้าง 2 วินาทีเพื่อเลือกเมนู
+
+    // ตัวละครรถเข็นสำหรับโหมดเล่นปกติ (ไม่ใช้กล้อง)
+    let cartX = CANVAS_WIDTH / 2;
+    const CART_HALF_WIDTH = 55;
+    const CART_SPEED = 14; // px ต่อเฟรม ตอนกดปุ่มลูกศร
+    let keysPressed = {};
+
+    window.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+            keysPressed[e.key] = true;
+            e.preventDefault();
+        }
+    });
+    window.addEventListener('keyup', (e) => {
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+            keysPressed[e.key] = false;
+        }
+    });
+    
+    let selectedMission = -1;
+    let selectedHat = -1;
+
+    // Missions Data
+    const missions = [
+        { id: 0, title: "การเลิกทาสและระบบไพร่" },
+        { id: 1, title: "การปฏิรูปการศาลและกฎหมาย" },
+        { id: 2, title: "การตั้งโรงเรียนราษฎร์แห่งแรก" },
+        { id: 3, title: "การสร้างทางรถไฟและโทรเลข" }
+    ];
+
+    const hats = [
+        { id: 0, color: '#FFFFFF', name: 'หมวกขาว', label: 'ข้อเท็จจริง', textColor: '#333' },
+        { id: 1, color: '#E74C3C', name: 'หมวกแดง', label: 'ความรู้สึก', textColor: '#FFF' },
+        { id: 2, color: '#2C3E50', name: 'หมวกดำ', label: 'ข้อเสีย/ความเสี่ยง', textColor: '#FFF' },
+        { id: 3, color: '#F1C40F', name: 'หมวกเหลือง', label: 'ข้อดี/โอกาส', textColor: '#333' },
+        { id: 4, color: '#2ECC71', name: 'หมวกเขียว', label: 'ทางเลือกใหม่', textColor: '#FFF' },
+        { id: 5, color: '#2980B9', name: 'หมวกน้ำเงิน', label: 'ข้อสรุป', textColor: '#FFF' }
+    ];
+
+    // Database of statements. แต่ละข้อมี hats array เพื่อบอกว่าตรงกับหมวกสีไหนบ้าง
+    // ทุกภารกิจมีโจทย์ที่ถูกต้อง (related) ของแต่ละหมวกอย่างน้อย 3 ข้อ
+    // เวลาเล่น ระบบจะสุ่มโจทย์ที่ไม่เกี่ยวข้อง (unrelated) มาจากคลังโจทย์ของภารกิจเดียวกันเอง
+    const gameDatabase = {
+        0: [ // ภารกิจที่ 1: การเลิกทาสและระบบไพร่
+            // หมวกขาว (0) - ข้อเท็จจริง
+            { text: "พ.ร.บ. พิกัดเกษียณอายุลูกทาส พ.ศ. 2417 กำหนดให้ลูกทาสที่เกิดตั้งแต่ปีนั้นจะได้เป็นไทเมื่ออายุครบ 21 ปี", hats: [0] },
+            { text: "พ.ร.บ. เลิกทาส ร.ศ. 124 (พ.ศ. 2448) ประกาศเลิกทาสทั่วราชอาณาจักรอย่างเป็นทางการ", hats: [0] },
+            { text: "ก่อนการปฏิรูป ไพร่ต้องถูกเกณฑ์แรงงานให้รัฐปีละหลายเดือนตามระบบไพร่หลวง", hats: [0] },
+            // หมวกแดง (1) - ความรู้สึก
+            { text: "ทาสบางคนดีใจจนน้ำตาไหลเมื่อทราบว่าตนจะได้เป็นไทตามกฎหมายใหม่", hats: [1] },
+            { text: "เจ้าของทาสบางรายรู้สึกไม่พอใจที่ต้องสูญเสียแรงงานที่เคยใช้ฟรี", hats: [1] },
+            { text: "ไพร่หลายคนรู้สึกโล่งใจที่ไม่ต้องถูกเกณฑ์แรงงานหนักเหมือนก่อน", hats: [1] },
+            // หมวกดำ (2) - ข้อเสีย/ความเสี่ยง
+            { text: "ทาสที่เป็นอิสระใหม่ๆ จำนวนมากไม่มีที่ดินทำกินหรืออาชีพรองรับ", hats: [2] },
+            { text: "ระบบเศรษฐกิจของเจ้านายที่เคยพึ่งพาแรงงานทาสเกิดปัญหาขาดแคลนคนทำงาน", hats: [2] },
+            { text: "การเปลี่ยนแปลงที่รวดเร็วเกินไปอาจสร้างความไม่พอใจจนนำไปสู่ความขัดแย้งกับกลุ่มเจ้านาย", hats: [2] },
+            // หมวกเหลือง (3) - ข้อดี/โอกาส
+            { text: "ราษฎรทุกคนมีสิทธิเสรีภาพในชีวิตและร่างกายของตนเองมากขึ้น", hats: [3] },
+            { text: "ต่างชาติมองว่าสยามมีความศิวิไลซ์ทัดเทียมนานาประเทศ ช่วยหนุนการเจรจาสนธิสัญญา", hats: [3] },
+            { text: "แรงงานที่เป็นอิสระสามารถเลือกงานและย้ายถิ่นได้ ช่วยกระตุ้นเศรษฐกิจเสรี", hats: [3] },
+            // หมวกเขียว (4) - ทางเลือกใหม่
+            { text: "แทนที่จะประกาศเลิกทาสทันที รัฐบาลเลือกวิธีค่อยๆ ลดตามพิกัดอายุเพื่อลดแรงต้าน", hats: [4] },
+            { text: "อาจจัดหาที่ดินทำกินหรืออาชีพให้ทาสที่พ้นสภาพเพื่อรองรับการเปลี่ยนผ่าน", hats: [4] },
+            { text: "รัฐอาจออกมาตรการชดเชยแก่เจ้าของทาสบางส่วนเพื่อลดแรงต่อต้าน", hats: [4] },
+            // หมวกน้ำเงิน (5) - ข้อสรุป
+            { text: "การเลิกทาสแบบค่อยเป็นค่อยไปช่วยให้สยามเปลี่ยนผ่านสู่สังคมสมัยใหม่โดยไม่เกิดความรุนแรง", hats: [5] },
+            { text: "นโยบายนี้แสดงให้เห็นวิสัยทัศน์ของรัชกาลที่ 5 ในการปฏิรูปโครงสร้างสังคม", hats: [5] },
+            { text: "ผลลัพธ์สุดท้ายคือสยามก้าวเข้าสู่ระบบแรงงานเสรีแทนระบบไพร่ทาสแบบเดิม", hats: [5] },
+        ],
+        1: [ // ภารกิจที่ 2: การปฏิรูปการศาลและกฎหมาย
+            // หมวกขาว (0)
+            { text: "พ.ศ. 2434 รัชกาลที่ 5 ทรงตั้งกระทรวงยุติธรรม รวมศาลที่กระจัดกระจายตามกระทรวงต่างๆ ให้มาอยู่ภายใต้หน่วยงานเดียว", hats: [0] },
+            { text: "รัฐบาลสยามว่าจ้างที่ปรึกษากฎหมายชาวต่างชาติมาช่วยร่างประมวลกฎหมาย", hats: [0] },
+            { text: "ก่อนการปฏิรูป การพิจารณาคดีบางคดีใช้วิธีจารีตนครบาลเพื่อให้จำเลยรับสารภาพ", hats: [0] },
+            // หมวกแดง (1)
+            { text: "ราษฎรบางส่วนไม่ไว้วางใจศาลแบบเก่าเพราะเคยเห็นการตัดสินที่ไม่เป็นธรรม", hats: [1] },
+            { text: "ขุนนางบางคนไม่พอใจที่อำนาจตัดสินคดีที่เคยอยู่ในมือตนถูกโอนไปยังกระทรวงยุติธรรม", hats: [1] },
+            { text: "ชาวต่างชาติที่อาศัยในสยามรู้สึกกังวลเมื่อต้องขึ้นศาลไทยหากไม่มีสิทธิสภาพนอกอาณาเขต", hats: [1] },
+            // หมวกดำ (2)
+            { text: "การเปลี่ยนระบบศาลอย่างรวดเร็วอาจทำให้ผู้พิพากษาและเจ้าหน้าที่เดิมปรับตัวไม่ทัน", hats: [2] },
+            { text: "การพึ่งพาที่ปรึกษากฎหมายต่างชาติมากเกินไปอาจทำให้กฎหมายไม่สอดคล้องกับบริบทสังคมไทย", hats: [2] },
+            { text: "ขุนนางท้องถิ่นที่เสียอำนาจตัดสินคดีอาจต่อต้านการปฏิรูป", hats: [2] },
+            // หมวกเหลือง (3)
+            { text: "ระบบศาลที่เป็นมาตรฐานเดียวกันช่วยให้การพิจารณาคดีเป็นธรรมและโปร่งใสมากขึ้น", hats: [3] },
+            { text: "การมีประมวลกฎหมายที่ทันสมัยเป็นเหตุผลสำคัญที่ใช้เจรจาต่อรองเพื่อยกเลิกสิทธิสภาพนอกอาณาเขต", hats: [3] },
+            { text: "ราษฎรมีช่องทางร้องทุกข์และได้รับความยุติธรรมที่ชัดเจนกว่าเดิม", hats: [3] },
+            // หมวกเขียว (4)
+            { text: "รัฐบาลเลือกส่งคนไทยไปศึกษากฎหมายต่างประเทศเพื่อลดการพึ่งพาที่ปรึกษาต่างชาติในระยะยาว", hats: [4] },
+            { text: "อาจเปิดให้ราษฎรมีส่วนร่วมแสดงความเห็นก่อนประกาศใช้ประมวลกฎหมายใหม่", hats: [4] },
+            { text: "ตั้งโรงเรียนกฎหมายขึ้นเพื่อผลิตนักกฎหมายไทยรองรับระบบศาลใหม่", hats: [4] },
+            // หมวกน้ำเงิน (5)
+            { text: "การปฏิรูปกระบวนการยุติธรรมเป็นก้าวสำคัญที่ช่วยยกระดับสยามให้ทัดเทียมนานาอารยประเทศ", hats: [5] },
+            { text: "แม้จะมีแรงต้านจากกลุ่มที่เสียผลประโยชน์ แต่ผลลัพธ์คือระบบศาลที่เป็นธรรมและเป็นเอกภาพมากขึ้น", hats: [5] },
+            { text: "การปฏิรูปนี้เป็นส่วนหนึ่งของยุทธศาสตร์รักษาเอกราชผ่านการปรับปรุงกฎหมายให้ทันสมัย", hats: [5] },
+        ],
+        2: [ // ภารกิจที่ 3: การตั้งโรงเรียนราษฎร์แห่งแรก
+            // หมวกขาว (0)
+            { text: "ช่วง พ.ศ. 2414-2424 เริ่มมีโรงเรียนหลวงสำหรับบุตรหลานขุนนางและมหาดเล็กในพระบรมมหาราชวัง เช่น โรงเรียนสวนกุหลาบ", hats: [0] },
+            { text: "ต่อมารัฐบาลขยายการศึกษาสู่ราษฎรสามัญชนโดยตั้งโรงเรียนตามวัดในกรุงเทพฯ", hats: [0] },
+            { text: "พ.ศ. 2430 มีการจัดตั้งกรมศึกษาธิการขึ้นเพื่อดูแลการศึกษาของประเทศอย่างเป็นระบบ", hats: [0] },
+            // หมวกแดง (1)
+            { text: "ผู้ปกครองราษฎรสามัญชนบางส่วนตื่นเต้นที่ลูกหลานของตนมีโอกาสได้เรียนหนังสือเช่นเดียวกับลูกขุนนาง", hats: [1] },
+            { text: "พระสงฆ์ในวัดที่เปิดสอนหนังสือรู้สึกภาคภูมิใจที่ได้มีส่วนร่วมสร้างคนให้ประเทศ", hats: [1] },
+            { text: "ขุนนางบางคนกังวลว่าการให้สามัญชนได้เรียนหนังสือจะสั่นคลอนสถานะทางสังคมแบบเดิม", hats: [1] },
+            // หมวกดำ (2)
+            { text: "โรงเรียนที่ตั้งขึ้นใหม่ยังขาดแคลนครูที่มีความรู้เพียงพอในหลายพื้นที่", hats: [2] },
+            { text: "ครอบครัวยากจนบางครัวเรือนไม่สามารถส่งลูกไปเรียนได้เพราะต้องใช้แรงงานเด็กช่วยทำมาหากิน", hats: [2] },
+            { text: "การศึกษาแบบใหม่ในช่วงแรกกระจุกตัวอยู่ในกรุงเทพฯ ทำให้หัวเมืองยังเข้าไม่ถึงโอกาสเท่ากัน", hats: [2] },
+            // หมวกเหลือง (3)
+            { text: "ราษฎรสามัญชนมีโอกาสอ่านออกเขียนได้และยกระดับฐานะทางสังคมผ่านการศึกษา", hats: [3] },
+            { text: "ประเทศมีบุคลากรที่มีความรู้เพิ่มขึ้นเพื่อรองรับงานราชการและงานสมัยใหม่ที่ซับซ้อน", hats: [3] },
+            { text: "การศึกษาที่แพร่หลายช่วยปูทางไปสู่สังคมที่ทันสมัยและแข่งขันกับนานาชาติได้", hats: [3] },
+            // หมวกเขียว (4)
+            { text: "ใช้วัดซึ่งเป็นศูนย์กลางชุมชนอยู่แล้วเป็นสถานที่เรียน ช่วยประหยัดการสร้างอาคารใหม่", hats: [4] },
+            { text: "อาจส่งเสริมให้พระสงฆ์ที่มีความรู้ช่วยสอนหนังสือแก่เด็กในชุมชนของตน", hats: [4] },
+            { text: "ควรขยายโรงเรียนไปยังหัวเมืองต่างจังหวัดให้เร็วขึ้นเพื่อลดความเหลื่อมล้ำทางการศึกษา", hats: [4] },
+            // หมวกน้ำเงิน (5)
+            { text: "การขยายการศึกษาสู่ราษฎรสามัญชนเป็นรากฐานสำคัญของการพัฒนาประเทศในระยะยาว", hats: [5] },
+            { text: "แม้เริ่มต้นด้วยทรัพยากรจำกัด แต่เป็นจุดเริ่มต้นของระบบการศึกษาสมัยใหม่ของไทย", hats: [5] },
+            { text: "การปฏิรูปนี้สะท้อนแนวคิดที่ว่าความรู้ควรเป็นของทุกคน ไม่จำกัดเฉพาะชนชั้นสูง", hats: [5] },
+        ],
+        3: [ // ภารกิจที่ 4: การสร้างทางรถไฟและโทรเลข
+            // หมวกขาว (0)
+            { text: "สยามเริ่มวางสายโทรเลขเชื่อมกรุงเทพฯ กับหัวเมืองสำคัญตั้งแต่ พ.ศ. 2418", hats: [0] },
+            { text: "ทางรถไฟสายกรุงเทพฯ-นครราชสีมา ซึ่งเป็นทางรถไฟหลวงสายแรกของสยาม เปิดใช้เต็มเส้นทางในปี พ.ศ. 2443", hats: [0] },
+            { text: "เส้นทางรถไฟและโทรเลขถูกขยายให้เชื่อมโยงไปยังหัวเมืองชายแดนเพื่อประโยชน์ด้านการปกครองและความมั่นคง", hats: [0] },
+            // หมวกแดง (1)
+            { text: "ราษฎรจำนวนมากรู้สึกตื่นตาตื่นใจเมื่อได้เห็นรถไฟที่วิ่งได้เร็วกว่าเกวียนหรือช้างมาก", hats: [1] },
+            { text: "พ่อค้าตามหัวเมืองรู้สึกยินดีที่สามารถส่งสินค้าไปขายยังเมืองหลวงได้สะดวกและรวดเร็วขึ้น", hats: [1] },
+            { text: "ข้าราชการหัวเมืองบางคนกังวลว่าส่วนกลางสั่งการได้เร็วขึ้นจะทำให้ตนเสียอำนาจปกครองตนเองแบบเดิม", hats: [1] },
+            // หมวกดำ (2)
+            { text: "การก่อสร้างทางรถไฟต้องใช้เงินลงทุนมหาศาลและก่อหนี้สินให้แก่ประเทศ", hats: [2] },
+            { text: "แรงงานที่ถูกเกณฑ์มาก่อสร้างทางรถไฟต้องทำงานหนักในสภาพแวดล้อมที่ยากลำบาก", hats: [2] },
+            { text: "การพึ่งพาวิศวกรและเทคโนโลยีจากต่างชาติทำให้สยามยังขาดความเป็นอิสระด้านเทคนิค", hats: [2] },
+            // หมวกเหลือง (3)
+            { text: "การคมนาคมที่รวดเร็วขึ้นช่วยให้รัฐบาลกลางปกครองและควบคุมหัวเมืองห่างไกลได้อย่างมีประสิทธิภาพ", hats: [3] },
+            { text: "ทางรถไฟช่วยกระตุ้นเศรษฐกิจโดยขนส่งสินค้าเกษตร เช่น ข้าว ออกสู่ตลาดได้เร็วขึ้น", hats: [3] },
+            { text: "โครงข่ายโทรเลขและรถไฟที่แผ่ขยายช่วยยืนยันอธิปไตยเหนือดินแดนและลดข้ออ้างของชาติตะวันตกในการยึดครอง", hats: [3] },
+            // หมวกเขียว (4)
+            { text: "รัฐบาลอาจร่วมมือกับเอกชนลงทุนสร้างทางรถไฟบางสายเพื่อแบ่งเบาภาระด้านงบประมาณของรัฐ", hats: [4] },
+            { text: "อาจฝึกอบรมช่างเทคนิคไทยควบคู่ไปกับการจ้างวิศวกรต่างชาติเพื่อถ่ายทอดความรู้ในระยะยาว", hats: [4] },
+            { text: "ควรวางแผนเส้นทางให้ครอบคลุมหัวเมืองยุทธศาสตร์ชายแดนก่อนเพื่อป้องกันการรุกรานจากมหาอำนาจ", hats: [4] },
+            // หมวกน้ำเงิน (5)
+            { text: "การสร้างทางรถไฟและโทรเลขเป็นเครื่องมือสำคัญที่ช่วยรวมศูนย์อำนาจและรักษาเอกราชของสยาม", hats: [5] },
+            { text: "แม้ต้องแลกด้วยเงินลงทุนและแรงงานจำนวนมาก แต่ผลลัพธ์คือประเทศที่ทันสมัยและเชื่อมโยงกันมากขึ้น", hats: [5] },
+            { text: "โครงสร้างพื้นฐานเหล่านี้วางรากฐานให้สยามพัฒนาเศรษฐกิจและการปกครองต่อเนื่องมาถึงปัจจุบัน", hats: [5] },
+        ]
+    };
+
+    // AR Game State Variables
+    let arQuestions = [];
+    let currentArQuestion = 0;
+    let arScore = 0;
+    
+    // Sub-states: "READY", "PLAYING", "RESULT"
+    let arSubState = "READY"; 
+    let arStateTimer = 0;
+    const READY_DURATION = 5000; // เวลาอ่านโจทย์ก่อนเริ่มเล่น 5 วินาที
+    let arGameTimer = 0; // The 10 second timer
+    
+    let arRocks = [];
+    let arRocksCollected = 0;
+    let arIsCurrentQuestionRelated = false;
+    let arFeedbackText = "";
+    let arFeedbackColor = "";
+    let arPauseLastTick = 0; // ใช้คำนวณเวลาที่หยุดไปจริง ตอนผู้เล่นหลุดออกนอกกล้อง
+
+    let buttons = [];
+
+    function resizeCanvas() {
+        canvas.width = CANVAS_WIDTH;
+        canvas.height = CANVAS_HEIGHT;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    function registerButton(id, x, y, w, h, action) {
+        buttons.push({ id, x, y, w, h, action });
+    }
+
+    // หาปุ่มที่เคอร์เซอร์ชี้อยู่ (ใช้ทั้งการไฮไลต์และการคลิก)
+    function findButtonAt(x, y) {
+        for (let btn of buttons) {
+            if (x >= btn.x && x <= btn.x + btn.w &&
+                y >= btn.y && y <= btn.y + btn.h) {
+                return btn;
+            }
+        }
+        return null;
+    }
+
+    // โหมดปกติ: ไฮไลต์เฉยๆ แล้วใช้การคลิกเลือก
+    // โหมด AR หลังเปิดกล้องแล้ว: ใช้มือชี้ค้าง 2 วินาทีเพื่อเลือก (คลิกเมาส์ก็ยังใช้ได้)
+    function checkHover() {
+        if (currentState === STATE_AR_GAME) {
+            hoverTarget = null;
+            return;
+        }
+
+        const found = findButtonAt(cursorX, cursorY);
+        const useDwell = (gameMode === 'AR' && cameraStarted && isPersonPresent);
+
+        if (!useDwell) {
+            hoverTarget = found;
+            hoverStartTime = 0;
+            return;
+        }
+
+        if (found) {
+            if (hoverTarget && hoverTarget.id === found.id) {
+                if (Date.now() - hoverStartTime >= HOVER_DURATION) {
+                    hoverTarget = null;
+                    hoverStartTime = 0;
+                    if (found.id !== 'btn_mute') sfxClick();
+                    found.action();
+                }
+            } else {
+                hoverTarget = found;
+                hoverStartTime = Date.now();
+            }
+        } else {
+            hoverTarget = null;
+            hoverStartTime = 0;
+        }
+    }
+
+    // คลิกเพื่อเลือกเมนู
+    canvas.addEventListener('click', (e) => {
+        if (currentState === STATE_AR_GAME) return;
+        const rect = canvas.getBoundingClientRect();
+        const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+        const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+        const btn = findButtonAt(x, y);
+        if (btn) {
+            ensureAudio(); // ปลดล็อกเสียงจากการคลิกครั้งแรกของผู้ใช้ ตามข้อกำหนดของเบราว์เซอร์
+            if (btn.id !== 'btn_mute') sfxClick();
+            btn.action();
+        }
+    });
+
+    function drawText(text, x, y, size, color, align = 'center', weight = 'normal', outline = false) {
+        ctx.font = `${weight} ${size}px 'Sarabun', sans-serif`;
+        ctx.textAlign = align;
+        ctx.textBaseline = 'alphabetic'; // ต้องตั้งทุกครั้ง เพราะการวาดอิโมจิตั้งค่าเป็น 'middle' ค้างไว้
+        if(outline) {
+            ctx.lineWidth = 4;
+            ctx.strokeStyle = '#000';
+            ctx.strokeText(text, x, y);
+        }
+        ctx.fillStyle = color;
+        ctx.fillText(text, x, y);
+    }
+
+    // ตัดข้อความยาวให้เป็นหลายบรรทัด (สูงสุดตามที่กำหนด) โดยพยายามให้แต่ละบรรทัดยาวใกล้เคียงกัน
+    // ภาษาไทยไม่มีช่องว่างระหว่างคำเสมอ จึงตัดที่ช่องว่างก่อน ถ้าไม่มีช่องว่างจึงตัดตามตัวอักษร
+    const _wrapCache = new Map(); // กันการวัดความกว้างซ้ำทุกเฟรม
+
+    function wrapText(text, maxWidth, fontSize, maxLines = 2) {
+        const key = `${text}|${maxWidth}|${fontSize}|${maxLines}`;
+        if (_wrapCache.has(key)) return _wrapCache.get(key);
+
+        ctx.font = `bold ${fontSize}px 'Sarabun', sans-serif`;
+        const width = (s) => ctx.measureText(s).width;
+        let result;
+
+        if (width(text) <= maxWidth) {
+            result = [text];
+        } else {
+            // ตั้งเป้าให้แต่ละบรรทัดยาวใกล้เคียงกัน (ข้อความไทยมักไม่มีช่องว่างระหว่างคำ
+            // จึงตัดทีละตัวอักษรได้ แต่จะเลือกตัดตรงช่องว่างถ้ามีอยู่ใกล้ๆ)
+            const lineCount = Math.min(maxLines, Math.ceil(width(text) / maxWidth));
+            const target = width(text) / lineCount;
+
+            let lines = [];
+            let rest = text;
+
+            for (let n = 0; n < lineCount && rest.length; n++) {
+                if (n === lineCount - 1) { lines.push(rest); rest = ''; break; }
+
+                let cut = 0;
+                while (cut < rest.length) {
+                    const w = width(rest.slice(0, cut + 1));
+                    if (w > maxWidth) break;
+                    cut++;
+                    if (w >= target) break;
+                }
+
+                // ถ้ามีช่องว่างใกล้จุดตัด ให้ตัดตรงช่องว่างแทนเพื่อไม่ให้คำขาดกลาง
+                const spaceAt = rest.lastIndexOf(' ', cut);
+                if (spaceAt > cut - 12 && spaceAt > 0) {
+                    cut = spaceAt;
+                } else {
+                    // เลี่ยงการตัดหน้าสระบน/ล่าง หรือวรรณยุกต์ ซึ่งจะทำให้ขึ้นบรรทัดใหม่ด้วยสระลอยๆ
+                    const THAI_COMBINING = /[\u0E31\u0E34-\u0E3A\u0E47-\u0E4E]/;
+                    let guard = 0;
+                    while (cut > 1 && guard++ < 8 && THAI_COMBINING.test(rest.charAt(cut))) {
+                        cut--;
+                    }
+                }
+
+                lines.push(rest.slice(0, cut).trim());
+                rest = rest.slice(cut).trim();
+            }
+
+            // บรรทัดสุดท้ายถ้ายังล้น ให้ตัดแล้วเติม …
+            let last = lines[lines.length - 1];
+            if (width(last) > maxWidth) {
+                while (last.length > 1 && width(last + '…') > maxWidth) last = last.slice(0, -1);
+                lines[lines.length - 1] = last + '…';
+            }
+            result = lines.filter(l => l.length);
+        }
+
+        _wrapCache.set(key, result);
+        return result;
+    }
+
+    function drawRoundedRect(x, y, w, h, radius, fillStyle, strokeStyle, strokeWidth = 2) {
+        ctx.beginPath();
+        ctx.moveTo(x + radius, y);
+        ctx.lineTo(x + w - radius, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+        ctx.lineTo(x + w, y + h - radius);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+        ctx.lineTo(x + radius, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+        ctx.lineTo(x, y + radius);
+        ctx.quadraticCurveTo(x, y, x + radius, y);
+        ctx.closePath();
+        
+        if (fillStyle) {
+            ctx.fillStyle = fillStyle;
+            ctx.fill();
+        }
+        if (strokeStyle) {
+            ctx.lineWidth = strokeWidth;
+            ctx.strokeStyle = strokeStyle;
+            ctx.stroke();
+        }
+    }
+
+    function drawScene() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        buttons = [];
+
+        if (currentState === STATE_AR_GAME) {
+            drawARGameScreen();
+        } else {
+            const arMenu = (gameMode === 'AR' && cameraStarted);
+
+            if (arMenu) {
+                // โหมด AR: กล้องเต็มจอตั้งแต่หน้าเมนู จะได้เห็นตัวเองขณะเล็งปุ่ม
+                ctx.save();
+                ctx.translate(canvas.width, 0);
+                ctx.scale(-1, 1);
+                try { ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height); } catch(e) {}
+                ctx.restore();
+                // ม่านทึบเพื่อให้ตัวหนังสือเมนูอ่านออก
+                ctx.fillStyle = 'rgba(30, 18, 6, 0.55)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+            } else {
+                // Draw Vintage Background for Menus
+                ctx.fillStyle = '#f4e4bc';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+            }
+            ctx.lineWidth = 4;
+            ctx.strokeStyle = '#cda434';
+            ctx.strokeRect(20, 20, canvas.width - 40, canvas.height - 40);
+
+            if (currentState === STATE_START) {
+                drawStartScreen();
+            } else if (currentState === STATE_MODE_SELECT) {
+                drawModeSelectScreen();
+            } else if (currentState === STATE_MISSIONS) {
+                drawMissionScreen();
+            } else if (currentState === STATE_HATS) {
+                drawHatsScreen();
+            } else if (currentState === STATE_SUMMARY) {
+                drawSummaryScreen();
+            }
+
+            // โหมด AR: แสดงเคอร์เซอร์ที่ควบคุมด้วยหัว
+            if (arMenu) {
+                if (isPersonPresent) {
+                    drawCursor();
+                } else {
+                    drawText("ยืนให้กล้องเห็นตัวคุณ", CANVAS_WIDTH/2, CANVAS_HEIGHT - 40, 26, '#F1C40F', 'center', 'bold', true);
+                }
+            }
+
+            // หน้ากติกาเป็นชั้นบนสุด และปิดการกดปุ่มด้านหลังไว้ กันการเลือกพลาด
+            if (showRules) {
+                buttons = [];
+                drawRulesOverlay();
+                if (gameMode === 'AR' && cameraStarted && isPersonPresent) drawCursor();
+            } else {
+                drawRulesButton();
+                drawMuteButton();
+            }
+        }
+    }
+
+    // ปุ่มเปิด/ปิดเสียง (สำคัญสำหรับใช้ในห้องเรียน)
+    function drawMuteButton() {
+        const ar = (gameMode === 'AR' && cameraStarted);
+        const bw = ar ? 110 : 64, bh = ar ? 80 : 54;
+        const rulesW = ar ? 260 : 180;
+        const bx = CANVAS_WIDTH - rulesW - 40 - bw - 12;
+        const by = ar ? CANVAS_HEIGHT - bh - 40 : 40;
+        const isHovered = hoverTarget && hoverTarget.id === 'btn_mute';
+        drawRoundedRect(bx, by, bw, bh, ar ? 40 : 27, isHovered ? '#5d4037' : '#795548', '#3e2723', 2);
+        drawText(audioMuted ? "🔇" : "🔊", bx + bw/2, by + bh/2 + (ar ? 12 : 10), ar ? 36 : 28, '#fff', 'center', 'bold');
+        registerButton('btn_mute', bx, by, bw, bh, () => {
+            audioMuted = !audioMuted;
+            if (audioMuted) stopMusic();
+            else sfxClick();
+        });
+    }
+
+    let showRules = false;
+
+    // ปุ่มเล็กมุมขวาบนของหน้าเมนู
+    // ===== ระบบเสียง =====
+    // สร้างเสียงด้วย Web Audio API ทั้งหมด ไม่ต้องโหลดไฟล์เสียงจากภายนอก
+    // จึงใช้งานได้แม้เน็ตโรงเรียนช้าหรือเปิดไฟล์แบบออฟไลน์
+    let audioCtx = null;
+    let audioMuted = false;
+    let musicTimer = null;
+    let musicStep = 0;
+
+    function ensureAudio() {
+        if (audioCtx) {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            return audioCtx;
+        }
+        try {
+            const AC = window.AudioContext || window.webkitAudioContext;
+            if (!AC) return null;
+            audioCtx = new AC();
+            return audioCtx;
+        } catch (e) {
+            return null; // เบราว์เซอร์ไม่รองรับ ก็เล่นเกมต่อได้ตามปกติ
+        }
+    }
+
+    function playTone(freq, dur, type = 'sine', vol = 0.18, delay = 0) {
+        if (audioMuted) return;
+        const ac = ensureAudio();
+        if (!ac) return;
+        try {
+            const t0 = ac.currentTime + delay;
+            const osc = ac.createOscillator();
+            const gain = ac.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, t0);
+            gain.gain.setValueAtTime(0.0001, t0);
+            gain.gain.exponentialRampToValueAtTime(vol, t0 + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+            osc.connect(gain);
+            gain.connect(ac.destination);
+            osc.start(t0);
+            osc.stop(t0 + dur + 0.05);
+        } catch (e) { /* ข้ามไปถ้าเล่นเสียงไม่ได้ */ }
+    }
+
+    // เก็บหินถูก: เสียงสดใสสองโน้ตไล่ขึ้น
+    function sfxCollect() {
+        playTone(880, 0.12, 'triangle', 0.22);
+        playTone(1320, 0.16, 'triangle', 0.18, 0.09);
+    }
+    // เก็บผิด (ข้อที่ต้องหลบ): เสียงตื๊ดต่ำ
+    function sfxWrong() {
+        playTone(160, 0.35, 'square', 0.20);
+        playTone(110, 0.40, 'square', 0.18, 0.12);
+    }
+    // ผ่านข้อ: เสียงแตรสั้นๆ
+    function sfxWin() {
+        playTone(523, 0.14, 'triangle', 0.22);
+        playTone(659, 0.14, 'triangle', 0.22, 0.13);
+        playTone(784, 0.30, 'triangle', 0.24, 0.26);
+    }
+    // ไม่ผ่านข้อ: เสียงไล่ลง
+    function sfxLose() {
+        playTone(392, 0.20, 'sawtooth', 0.16);
+        playTone(262, 0.35, 'sawtooth', 0.16, 0.18);
+    }
+    // กดปุ่ม
+    function sfxClick() {
+        playTone(660, 0.08, 'sine', 0.15);
+    }
+    // หินใกล้จะถึงตัว (เตือนเบาๆ)
+    function sfxRockSpawn() {
+        playTone(300, 0.06, 'sine', 0.07);
+    }
+
+    // ดนตรีประกอบระหว่างเล่น: วนโน้ตเพนทาโทนิกเบาๆ ไม่ให้กลบเสียงเอฟเฟกต์
+    const MUSIC_NOTES = [294, 330, 392, 440, 392, 330, 294, 262];
+    function startMusic() {
+        if (musicTimer) return;
+        ensureAudio();
+        musicStep = 0;
+        musicTimer = setInterval(() => {
+            if (audioMuted) return;
+            playTone(MUSIC_NOTES[musicStep % MUSIC_NOTES.length], 0.32, 'triangle', 0.05);
+            if (musicStep % 4 === 0) playTone(131, 0.5, 'sine', 0.05); // เสียงเบสคุมจังหวะ
+            musicStep++;
+        }, 430);
+    }
+    function stopMusic() {
+        if (musicTimer) {
+            clearInterval(musicTimer);
+            musicTimer = null;
+        }
+    }
+
+    function drawRulesButton() {
+        const ar = (gameMode === 'AR' && cameraStarted);
+        const bw = ar ? 260 : 180, bh = ar ? 80 : 54;
+        const bx = CANVAS_WIDTH - bw - 40, by = ar ? CANVAS_HEIGHT - bh - 40 : 40;
+        const isHovered = hoverTarget && hoverTarget.id === 'btn_rules';
+        drawRoundedRect(bx, by, bw, bh, ar ? 40 : 27, isHovered ? '#b8860b' : '#cda434', '#3e2723', 2);
+        drawText("📖 ดูกติกา", bx + bw/2, by + bh/2 + (ar ? 11 : 9), ar ? 32 : 24, '#fff', 'center', 'bold');
+        registerButton('btn_rules', bx, by, bw, bh, () => { showRules = true; });
+    }
+
+    // หน้ากติกา: อธิบายวิธีเล่นทั้งสองโหมดครั้งเดียว จะได้ไม่ต้องรกหน้าจอตอนเล่นจริง
+    function drawRulesOverlay() {
+        ctx.fillStyle = 'rgba(20, 12, 4, 0.88)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        const panelX = 120, panelY = 50, panelW = CANVAS_WIDTH - 240, panelH = CANVAS_HEIGHT - 160;
+        drawRoundedRect(panelX, panelY, panelW, panelH, 20, '#f4e4bc', '#d4af37', 4);
+
+        drawText("กติกาการเล่น", CANVAS_WIDTH/2, panelY + 60, 44, '#800000', 'center', 'bold');
+
+        // กติกาหลัก (ใช้ร่วมกันทั้งสองโหมด)
+        let y = panelY + 115;
+        drawText("อ่านโจทย์ แล้วตัดสินใจว่าโจทย์นั้นตรงกับ \"หมวก\" ที่คุณเลือกหรือไม่", CANVAS_WIDTH/2, y, 26, '#3e2723', 'center', 'bold');
+
+        y += 50;
+        drawRoundedRect(panelX + 40, y - 30, panelW - 80, 62, 12, '#e8f5e9', '#2ECC71', 2);
+        drawText("✅ ถ้า \"เกี่ยว\" กับหมวกของคุณ → รับหินให้ครบ 5 ก้อน ภายใน 15 วินาที", CANVAS_WIDTH/2, y + 8, 24, '#1b5e20', 'center', 'bold');
+
+        y += 78;
+        drawRoundedRect(panelX + 40, y - 30, panelW - 80, 62, 12, '#ffebee', '#E74C3C', 2);
+        drawText("❌ ถ้า \"ไม่เกี่ยว\" → หลบหินให้พ้นทุกก้อน จนครบ 15 วินาที", CANVAS_WIDTH/2, y + 8, 24, '#b71c1c', 'center', 'bold');
+
+        // วิธีบังคับของแต่ละโหมด
+        y += 85;
+        drawText("วิธีบังคับตัวละคร", CANVAS_WIDTH/2, y, 28, '#800000', 'center', 'bold');
+
+        const colW = (panelW - 120) / 2;
+        const col1X = panelX + 40, col2X = panelX + 80 + colW;
+        const boxY = y + 20, boxH = 145;
+
+        drawRoundedRect(col1X, boxY, colW, boxH, 12, '#fff9eb', '#cda434', 2);
+        drawText("📷 โหมดเปิดกล้อง (AR)", col1X + colW/2, boxY + 36, 24, '#3e2723', 'center', 'bold');
+        drawText("ขยับตัว หัว และมือจริง", col1X + colW/2, boxY + 72, 21, '#5d4037', 'center');
+        drawText("ให้โดนหิน หรือหลบหิน", col1X + colW/2, boxY + 100, 21, '#5d4037', 'center');
+        drawText("เลือกเมนูโดยขยับหัวค้างไว้ 2 วิ", col1X + colW/2, boxY + 128, 20, '#800000', 'center', 'bold');
+
+        drawRoundedRect(col2X, boxY, colW, boxH, 12, '#fff9eb', '#cda434', 2);
+        drawText("🛒 โหมดเล่นปกติ", col2X + colW/2, boxY + 36, 24, '#3e2723', 'center', 'bold');
+        drawText("เลื่อนเมาส์ซ้าย-ขวา", col2X + colW/2, boxY + 72, 21, '#5d4037', 'center');
+        drawText("หรือกดปุ่ม ← → บังคับรถเข็น", col2X + colW/2, boxY + 100, 21, '#5d4037', 'center');
+        drawText("เลือกเมนูโดยคลิกเมาส์", col2X + colW/2, boxY + 128, 20, '#800000', 'center', 'bold');
+
+        // ปุ่มปิด
+        const cw = 260, ch = 64, cx = CANVAS_WIDTH/2 - cw/2, cy = panelY + panelH + 20;
+        const isHovered = hoverTarget && hoverTarget.id === 'btn_rules_close';
+        drawRoundedRect(cx, cy, cw, ch, 32, isHovered ? '#6b0000' : '#800000', '#d4af37', 3);
+        drawText("เข้าใจแล้ว ปิดหน้านี้", CANVAS_WIDTH/2, cy + 42, 26, '#fff', 'center', 'bold');
+        registerButton('btn_rules_close', cx, cy, cw, ch, () => { showRules = false; });
+    }
+
+    // จอพรีวิวกล้องเล็กๆ มุมขวาล่าง (เฉพาะหน้าเมนูในโหมด AR)
+    function drawCursor() {
+        ctx.beginPath();
+        ctx.arc(cursorX, cursorY, 15, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255, 204, 0, 0.85)';
+        ctx.fill();
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#fff';
+        ctx.stroke();
+
+        // วงแหวนแสดงความคืบหน้าตอนชี้ค้าง
+        if (hoverTarget && hoverStartTime) {
+            const progress = Math.min((Date.now() - hoverStartTime) / HOVER_DURATION, 1);
+            ctx.beginPath();
+            ctx.arc(cursorX, cursorY, 30, -Math.PI/2, (-Math.PI/2) + (Math.PI * 2 * progress));
+            ctx.strokeStyle = '#e74c3c';
+            ctx.lineWidth = 6;
+            ctx.lineCap = 'round';
+            ctx.stroke();
+        }
+    }
+
+    function drawStartScreen() {
+        drawText("เปิดแฟ้มลับ", CANVAS_WIDTH/2, 250, 80, '#800000', 'center', 'bold');
+        drawText("ประวัติศาสตร์ ร.๕ กับหมวก 6 ใบ", CANVAS_WIDTH/2, 340, 50, '#3e2723', 'center', 'bold');
+
+        let bw = 400, bh = 90;
+        let bx = CANVAS_WIDTH/2 - bw/2, by = 480;
+        let isHovered = hoverTarget && hoverTarget.id === 'btn_start';
+        
+        drawRoundedRect(bx, by, bw, bh, 45, isHovered ? '#6b0000' : '#800000', '#d4af37', 4);
+        drawText("▶ เริ่มเกม", CANVAS_WIDTH/2, by + 58, 40, '#FFF', 'center', 'bold');
+        
+        registerButton('btn_start', bx, by, bw, bh, () => {
+            currentState = STATE_MODE_SELECT;
+        });
+
+        drawText("คลิกที่ปุ่มเพื่อเริ่มต้น", CANVAS_WIDTH/2, 620, 24, '#7a6a52', 'center');
+    }
+
+    function drawModeSelectScreen() {
+        drawText("เลือกรูปแบบการเล่น", CANVAS_WIDTH/2, 120, 54, '#800000', 'center', 'bold');
+
+        let cardW = 460, cardH = 320, gap = 60;
+        let startX = CANVAS_WIDTH/2 - cardW - gap/2, cardY = 220;
+
+        const modes = [
+            {
+                id: 'AR', x: startX, icon: '📷',
+                title: 'เปิดกล้อง (AR)',
+                lines: ['ใช้กล้องจับการเคลื่อนไหวจริง', 'ขยับตัวและมือเพื่อรับหรือหลบหิน', '(ต้องอนุญาตให้ใช้กล้อง)']
+            },
+            {
+                id: 'NORMAL', x: startX + cardW + gap, icon: '🛒',
+                title: 'เล่นเกมปกติ',
+                lines: ['ไม่ต้องใช้กล้อง', 'เลื่อนรถเข็นด้วยเมาส์ หรือปุ่ม ← →', 'เพื่อรับหรือหลบหิน']
+            }
+        ];
+
+        for (let m of modes) {
+            let isHovered = hoverTarget && hoverTarget.id === `btn_mode_${m.id}`;
+            drawRoundedRect(m.x, cardY, cardW, cardH, 20,
+                isHovered ? '#eaddcd' : '#fff9eb',
+                isHovered ? '#800000' : '#cda434', isHovered ? 5 : 3);
+
+            ctx.font = '70px Arial';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'alphabetic';
+            ctx.fillStyle = '#333';
+            ctx.fillText(m.icon, m.x + cardW/2, cardY + 100);
+
+            drawText(m.title, m.x + cardW/2, cardY + 165, 38, '#800000', 'center', 'bold');
+            for (let i = 0; i < m.lines.length; i++) {
+                drawText(m.lines[i], m.x + cardW/2, cardY + 215 + i * 34, 22, '#5d4037', 'center');
+            }
+
+            registerButton(`btn_mode_${m.id}`, m.x, cardY, cardW, cardH, () => {
+                gameMode = m.id;
+                if (gameMode === 'AR') {
+                    initMediaPipe();
+                } else {
+                    stopMediaPipe(); // โหมดปกติ: ไม่ tracking อะไรเลย
+                }
+                currentState = STATE_MISSIONS;
+            });
+        }
+
+        drawBackButton(STATE_START);
+    }
+
+    function drawMissionScreen() {
+        drawText("เลือกแฟ้มคดีประวัติศาสตร์", CANVAS_WIDTH/2, 100, 50, '#800000', 'center', 'bold');
+
+        // ขนาดการ์ดถูกจัดให้จบก่อน y=530 เพื่อไม่ให้ทับจอพรีวิวกล้องมุมขวาล่าง
+        let cols = 2, cardW = 420, cardH = 150, gapX = 60, gapY = 35;
+        let startX = (CANVAS_WIDTH - (cols * cardW + gapX)) / 2, startY = 190;
+
+        for (let i = 0; i < missions.length; i++) {
+            let col = i % cols, row = Math.floor(i / cols);
+            let cx = startX + col * (cardW + gapX), cy = startY + row * (cardH + gapY);
+            let isHovered = hoverTarget && hoverTarget.id === `btn_mission_${i}`;
+            
+            drawRoundedRect(cx, cy, cardW, cardH, 15, isHovered ? '#eaddcd' : '#fff9eb', isHovered ? '#800000' : '#cda434', isHovered ? 5 : 3);
+            ctx.fillStyle = '#800000';
+            ctx.fillRect(cx, cy, 26, cardH);
+            drawText(`ภารกิจที่ ${i+1}`, cx + cardW/2 + 10, cy + 55, 22, '#800000', 'center');
+            drawText(missions[i].title, cx + cardW/2 + 10, cy + 100, 28, '#333', 'center', 'bold');
+
+            registerButton(`btn_mission_${i}`, cx, cy, cardW, cardH, () => {
+                selectedMission = i;
+                currentState = STATE_HATS;
+            });
+        }
+        drawBackButton(STATE_MODE_SELECT);
+    }
+
+    function drawHatsScreen() {
+        drawText(`ภารกิจ: ${missions[selectedMission].title}`, CANVAS_WIDTH/2, 100, 40, '#3e2723', 'center', 'bold');
+        drawText(`เลือกสวมหมวกเพื่อเริ่มเล่น (โหมด: ${gameMode === 'AR' ? 'เปิดกล้อง AR' : 'เล่นเกมปกติ'})`,
+                 CANVAS_WIDTH/2, 150, 28, '#800000', 'center');
+
+        let radius = 70, startX = 200, startY = 320, spacingX = 300, spacingY = 200;
+
+        for (let i = 0; i < hats.length; i++) {
+            let col = i % 3, row = Math.floor(i / 3);
+            let cx = startX + col * spacingX + 140, cy = startY + row * spacingY;
+            let h = hats[i];
+            let isHovered = hoverTarget && hoverTarget.id === `btn_hat_${i}`;
+            
+            ctx.beginPath();
+            ctx.arc(cx, cy, isHovered ? radius + 10 : radius, 0, Math.PI * 2);
+            ctx.fillStyle = h.color;
+            ctx.fill();
+            ctx.lineWidth = 4;
+            ctx.strokeStyle = isHovered ? '#ffcc00' : '#333';
+            ctx.stroke();
+
+            drawText(h.name, cx, cy - 10, 24, h.textColor, 'center', 'bold', h.id===0);
+            drawText(h.label, cx, cy + 20, 18, h.textColor, 'center', 'normal', h.id===0);
+
+            registerButton(`btn_hat_${i}`, cx - radius, cy - radius, radius*2, radius*2, () => {
+                selectedHat = i;
+                initARGame();
+            });
+        }
+        drawBackButton(STATE_MISSIONS);
+    }
+
+    // สลับลำดับอาร์เรย์แบบ Fisher-Yates โดยไม่แก้ต้นฉบับ (คืนอาร์เรย์ใหม่เสมอ)
+    function shuffleArray(arr) {
+        let a = [...arr];
+        for (let i = a.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [a[i], a[j]] = [a[j], a[i]];
+        }
+        return a;
+    }
+
+    function initARGame() {
+        currentState = STATE_AR_GAME;
+        startMusic();
+        arScore = 0;
+        currentArQuestion = 0;
+
+        // ดึงคลังโจทย์ของภารกิจนี้ (ถ้าไม่มีข้อมูลจริง ใช้ภารกิจแรกแทน)
+        let pool = gameDatabase[selectedMission] || gameDatabase[0];
+
+        // แยกโจทย์ที่ "เกี่ยวข้อง" กับหมวกที่เลือก ออกจากโจทย์อื่นๆ ในภารกิจเดียวกัน ("ไม่เกี่ยวข้อง")
+        let related = shuffleArray(pool.filter(q => q.hats.includes(selectedHat)));
+        let unrelated = shuffleArray(pool.filter(q => !q.hats.includes(selectedHat)));
+
+        // การันตีว่ามีโจทย์ที่เกี่ยวข้องอย่างน้อย (สูงสุด 3 ข้อ) แล้วเติมโจทย์ไม่เกี่ยวข้องให้ครบ 5 ข้อ
+        // เพื่อป้องกันไม่ให้รอบใดรอบหนึ่งกลายเป็น "หลบอย่างเดียว" ทั้ง 5 ข้อ
+        let pickedRelated = related.slice(0, 3);
+        let pickedUnrelated = unrelated.slice(0, 5 - pickedRelated.length);
+
+        arQuestions = shuffleArray([...pickedRelated, ...pickedUnrelated]);
+
+        startARQuestion(currentArQuestion);
+    }
+
+    function startARQuestion(index) {
+        if(index >= arQuestions.length) {
+            stopMusic();
+            currentState = STATE_SUMMARY;
+            return;
+        }
+        
+        let q = arQuestions[index];
+        arIsCurrentQuestionRelated = q.hats.includes(selectedHat);
+        arRocks = [];
+        arRocksCollected = 0;
+        cartX = CANVAS_WIDTH / 2; // รีเซ็ตรถเข็นกลับกลางจอทุกข้อ
+        
+        arSubState = "READY";
+        arStateTimer = Date.now(); // ให้เวลาอ่านโจทย์ 5 วินาทีก่อนหินเริ่มตก
+    }
+
+    // วาดกล่องโจทย์ด้านบน รองรับข้อความยาวโดยตัดเป็น 2 บรรทัด
+    // คำนวณความสูงกล่องจากจำนวนบรรทัดจริง เพื่อให้ข้อความอยู่ในกรอบพอดีเสมอ
+    function drawQuestionBox(q, h) {
+        const boxX = 100, boxY = 20, boxW = CANVAS_WIDTH - 200;
+        const padTop = 14, padBottom = 18;
+        const headSize = 24, headGap = 14;
+        const fontSize = 34, lineGap = 10;
+        const lineHeight = fontSize + lineGap;
+
+        const lines = wrapText(`โจทย์: "${q.text}"`, boxW - 60, fontSize, 2);
+        const boxH = padTop + headSize + headGap + lines.length * lineHeight + padBottom;
+
+        drawRoundedRect(boxX, boxY, boxW, boxH, 20, 'rgba(255,255,255,0.92)', h.color, 4);
+
+        // baseline ของหัวข้อ = ขอบบน + padding + ความสูงตัวอักษร
+        const headBaseline = boxY + padTop + headSize;
+        drawText(`ข้อที่ ${currentArQuestion+1}/${arQuestions.length} | ${h.name} (${h.label})`,
+                 CANVAS_WIDTH/2, headBaseline, headSize, h.color, 'center', 'bold');
+
+        // baseline บรรทัดแรกของโจทย์ เว้นจากหัวข้อลงมา แล้วไล่ทีละ lineHeight
+        const firstBaseline = headBaseline + headGap + fontSize;
+        for (let i = 0; i < lines.length; i++) {
+            drawText(lines[i], CANVAS_WIDTH/2, firstBaseline + i * lineHeight, fontSize, '#333', 'center', 'bold');
+        }
+        return boxY + boxH;
+    }
+
+    function drawARGameScreen() {
+        if (gameMode === 'AR') {
+            // 1. พื้นหลังภาพจากกล้อง (กลับด้านซ้าย-ขวาให้เหมือนส่องกระจก)
+            ctx.save();
+            ctx.translate(canvas.width, 0);
+            ctx.scale(-1, 1);
+            ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+            ctx.restore();
+
+            // 2. เอฟเฟกต์ภาพเก่า
+            ctx.fillStyle = 'rgba(139, 101, 8, 0.2)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+        } else {
+            // โหมดปกติ: พื้นหลังวาดเอง ไม่ใช้กล้อง
+            let grd = ctx.createLinearGradient(0, 0, 0, CANVAS_HEIGHT);
+            grd.addColorStop(0, '#d8c49a');
+            grd.addColorStop(1, '#f4e4bc');
+            ctx.fillStyle = grd;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // พื้นดิน
+            ctx.fillStyle = '#a1887f';
+            ctx.fillRect(0, CANVAS_HEIGHT - 60, CANVAS_WIDTH, 60);
+        }
+
+        // 3. วาดตัวผู้เล่น (มือ/หัว หรือ รถเข็น) เฉพาะตอนกำลังเล่น
+        if (arSubState === "PLAYING") {
+            if (gameMode === 'AR') {
+                if (isPersonPresent) {
+                    drawHitbox(headPos, '😎', 60);
+                    drawHitbox(leftHandPos, '✋', 50);
+                    drawHitbox(rightHandPos, '✋', 50);
+                }
+            } else {
+                updateCartPosition();
+                drawCart();
+            }
+        } else if (gameMode === 'NORMAL') {
+            drawCart(); // ให้เห็นรถเข็นตั้งแต่ตอนอ่านโจทย์
+        }
+
+        let q = arQuestions[currentArQuestion];
+        let h = hats[selectedHat];
+
+        // 4. กล่องโจทย์ด้านบน (แสดงตลอด รวมถึงช่วงอ่านโจทย์)
+        drawQuestionBox(q, h);
+
+        // State Machine
+        let now = Date.now();
+        if (arSubState === "READY") {
+            let elapsed = now - arStateTimer;
+            let remain = Math.ceil((READY_DURATION - elapsed) / 1000);
+
+            // ม่านดำบางๆ เฉพาะครึ่งล่าง เพื่อให้ยังอ่านโจทย์ด้านบนได้ชัด
+            ctx.fillStyle = 'rgba(0,0,0,0.55)';
+            ctx.fillRect(0, 230, canvas.width, canvas.height - 230);
+
+            // ไม่อธิบายกติกาซ้ำตรงนี้แล้ว (ดูได้จากปุ่ม "ดูกติกา" ในหน้าเมนู)
+            // เหลือแค่โจทย์ด้านบนกับข้อความเตรียมตัว เพื่อไม่ให้จอรก
+            drawText("อ่านโจทย์ให้ดี แล้วเตรียมตัว!", CANVAS_WIDTH/2, 400, 54, '#FFF', 'center', 'bold');
+
+            // นับถอยหลังตัวใหญ่
+            drawText(`${Math.max(remain, 1)}`, CANVAS_WIDTH/2, 560, 110, '#F1C40F', 'center', 'bold', true);
+
+            if (elapsed > READY_DURATION) {
+                arSubState = "PLAYING";
+                arStateTimer = Date.now();
+            }
+        } 
+        else if (arSubState === "PLAYING") {
+            // หยุดเกมชั่วคราวเมื่อโหมด AR มองไม่เห็นผู้เล่น
+            const paused = (gameMode === 'AR' && !isPersonPresent);
+
+            if (paused) {
+                // เลื่อนเวลาเริ่มต้นไปตามเวลาจริงที่ผ่านไป = เวลาที่นับค้างไว้ "หยุดนิ่ง" สนิท
+                // (ของเดิมบวกทีละ 16 มิลลิวินาทีต่อเฟรม ซึ่งไม่ตรงกับเวลาจริง เวลาจึงยังเดินอยู่)
+                if (arPauseLastTick) arStateTimer += (now - arPauseLastTick);
+                arPauseLastTick = now;
+            } else {
+                arPauseLastTick = 0;
+            }
+
+            updateAndDrawRocks(paused);
+
+            if (paused) {
+                drawText("⏸ หยุดเวลาชั่วคราว", CANVAS_WIDTH/2, CANVAS_HEIGHT - 215, 32, '#F1C40F', 'center', 'bold', true);
+                drawText("⚠️ กลับเข้ามาในกล้องด้วย!", CANVAS_WIDTH/2, CANVAS_HEIGHT - 160, 40, '#E74C3C', 'center', 'bold', true);
+            } else {
+                checkARWinLoss(now);
+            }
+        }
+        else if (arSubState === "RESULT") {
+            let elapsed = now - arStateTimer;
+            drawText(arFeedbackText, CANVAS_WIDTH/2, CANVAS_HEIGHT/2, 54, arFeedbackColor, 'center', 'bold', true);
+            if(elapsed > 2000) {
+                currentArQuestion++;
+                startARQuestion(currentArQuestion);
+            }
+        }
+
+        // ปุ่มออกจากภารกิจ (กดได้ทุกช่วง)
+        drawQuitButton();
+    }
+
+    // ปุ่มออกกลางเกม - ใช้ hit-test ของตัวเองเพราะช่วง AR_GAME ไม่ได้ลงทะเบียนปุ่มปกติ
+    let quitBtnRect = { x: CANVAS_WIDTH - 200, y: CANVAS_HEIGHT - 70, w: 170, h: 50 };
+    function drawQuitButton() {
+        let r = quitBtnRect;
+        drawRoundedRect(r.x, r.y, r.w, r.h, 25, 'rgba(120,20,20,0.85)', '#fff', 2);
+        drawText("✕ ออกจากภารกิจ", r.x + r.w/2, r.y + 33, 20, '#fff', 'center', 'bold');
+    }
+
+    function updateCartPosition() {
+        if (keysPressed['ArrowLeft']) cartX -= CART_SPEED;
+        if (keysPressed['ArrowRight']) cartX += CART_SPEED;
+        cartX = Math.max(CART_HALF_WIDTH, Math.min(CANVAS_WIDTH - CART_HALF_WIDTH, cartX));
+    }
+
+    function drawCart() {
+        const y = CANVAS_HEIGHT - 95;
+        ctx.font = '80px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('🛒', cartX, y);
+        // คนเข็นอยู่ด้านหลังรถ
+        ctx.font = '55px Arial';
+        ctx.fillText('🧍', cartX - 60, y + 8);
+    }
+
+    function drawHitbox(pos, emoji, size) {
+        if(!pos.active) return;
+        ctx.font = `${size}px Arial`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(emoji, pos.x, pos.y);
+    }
+
+    function updateAndDrawRocks(paused = false) {
+        let now = Date.now();
+        let elapsedSec = (now - arStateTimer) / 1000;
+        arGameTimer = Math.max(0, 15 - elapsedSec);
+
+        // Draw Timer and Collection Status (Neutral Display)
+        drawText(`เวลา: ${arGameTimer.toFixed(1)} วิ`, 150, 160, 36, '#FFF', 'left', 'bold', true);
+        drawText(`เก็บหิน: ${arRocksCollected}`, CANVAS_WIDTH - 150, 160, 36, '#FFF', 'right', 'bold', true);
+
+        // ขณะหยุดชั่วคราว: วาดหินค้างไว้เฉยๆ ไม่ตก ไม่เกิดใหม่ ไม่ตรวจการชน
+        if (paused) {
+            for (let r of arRocks) {
+                if (!r.active) continue;
+                ctx.font = '50px Arial';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('🪨', r.x, r.y);
+            }
+            return;
+        }
+
+        // คุมให้มีหินตกลงมาทีละ 1-2 ก้อนบนหน้าจอ
+        let activeRocks = arRocks.filter(r => r.active).length;
+        if (activeRocks < 2 && Math.random() < 0.03) { 
+            arRocks.push({
+                x: Math.random() * (CANVAS_WIDTH - 100) + 50,
+                y: -50,
+                radius: 35,
+                speed: 3 + Math.random() * 2, // หินตกด้วยความเร็วพอดีๆ
+                active: true
+            });
+            sfxRockSpawn(); // เสียงเบาๆ บอกว่ามีหินก้อนใหม่ร่วงลงมา
+        }
+
+        // Update & Draw Rocks
+        for(let i=0; i<arRocks.length; i++) {
+            let r = arRocks[i];
+            if(!r.active) continue;
+
+            r.y += r.speed;
+            
+            // Draw Rock Emoji
+            ctx.font = '50px Arial';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('🪨', r.x, r.y);
+
+            // ตรวจการชน: โหมด AR ใช้หัว/มือ, โหมดปกติใช้ปากรถเข็น
+            let hit = false;
+            if (gameMode === 'AR') {
+                if (isPersonPresent) {
+                    hit = checkCollision(r, headPos, 35) ||
+                          checkCollision(r, leftHandPos, 30) ||
+                          checkCollision(r, rightHandPos, 30);
+                }
+            } else {
+                // รถเข็น: กล่องสี่เหลี่ยมบริเวณปากรถ
+                const cartTop = CANVAS_HEIGHT - 130;
+                const cartBottom = CANVAS_HEIGHT - 60;
+                hit = (r.y + r.radius >= cartTop) && (r.y - r.radius <= cartBottom) &&
+                      (Math.abs(r.x - cartX) <= CART_HALF_WIDTH + r.radius * 0.5);
+            }
+
+            if (hit) {
+                r.active = false;
+                arRocksCollected++;
+
+                // ถ้าโจทย์ไม่เกี่ยวกับหมวก (ต้องหลบ) แล้วโดนหิน = แพ้ทันที
+                if(!arIsCurrentQuestionRelated) {
+                    sfxWrong();
+                    endARRound(false, "❌ รับหินผิด! โจทย์นี้ไม่เกี่ยวกับหมวกของคุณ จึงต้องหลบ");
+                    return;
+                }
+                sfxCollect();
+            }
+
+            if(r.y > CANVAS_HEIGHT + 50) r.active = false;
+        }
+    }
+
+    function checkCollision(rock, bodyPart, partRadius) {
+        if(!bodyPart.active) return false;
+        let dx = rock.x - bodyPart.x;
+        let dy = rock.y - bodyPart.y;
+        let distance = Math.sqrt(dx*dx + dy*dy);
+        return distance < (rock.radius + partRadius);
+    }
+
+    function checkARWinLoss(now) {
+        if (arSubState !== "PLAYING") return;
+
+        // หมายเหตุ: กรณีไม่มีผู้เล่นในเฟรม (โหมด AR) ถูกจัดการเป็น "หยุดเวลา" ใน drawARGameScreen แล้ว
+        // และหยุดเหมือนกันทุกข้อ เพื่อไม่ให้เดาได้ว่าข้อไหนเป็นข้อหลบ
+        let elapsedSec = (now - arStateTimer) / 1000;
+
+        if (arIsCurrentQuestionRelated) {
+            // ต้องเก็บหินให้ครบ 5 ก้อน
+            if (arRocksCollected >= 5) {
+                endARRound(true, "✅ ยอดเยี่ยม! เก็บครบ 5 ก้อน");
+            } else if (elapsedSec >= 15) {
+                endARRound(false, "❌ หมดเวลา! เก็บหินไม่ครบ 5 ก้อน");
+            }
+        } else {
+            // ต้องหลบให้ครบ 15 วินาที (เงื่อนไขแพ้ถูกเช็กในลูปหินแล้ว)
+            if (elapsedSec >= 15) {
+                endARRound(true, "✅ รอดพ้น! คุณวิเคราะห์ถูกว่าต้องหลบ");
+            }
+        }
+    }
+
+    function endARRound(isWin, msg) {
+        if(isWin) arScore++;
+        arFeedbackText = msg;
+        arFeedbackColor = isWin ? '#2ECC71' : '#E74C3C';
+        arSubState = "RESULT";
+        arStateTimer = Date.now();
+        // เสียงสรุปผลของข้อนั้น (เสียงตอนรับหินผิดเล่นไปแล้วก่อนเรียกฟังก์ชันนี้)
+        if (isWin) sfxWin(); else sfxLose();
+    }
+
+    function drawSummaryScreen() {
+        drawText("สรุปผลการวิเคราะห์", CANVAS_WIDTH/2, 200, 60, '#800000', 'center', 'bold');
+        
+        let resultColor = arScore >= 3 ? '#2ECC71' : '#E74C3C';
+        drawText(`คุณทำคะแนนได้: ${arScore} / 5 ข้อ`, CANVAS_WIDTH/2, 350, 48, resultColor, 'center', 'bold');
+        
+        let feedback = arScore >= 4 ? "สุดยอด! คุณแยกแยะข้อมูลประวัติศาสตร์ได้แม่นยำมาก" 
+                     : arScore >= 3 ? "เก่งมาก! ฝึกอีกนิดจะวิเคราะห์ได้เฉียบขาด" 
+                     : "พยายามเข้านะ! ลองทบทวนมุมมองของหมวกสีนี้ดูอีกครั้ง";
+        drawText(feedback, CANVAS_WIDTH/2, 450, 32, '#333', 'center');
+
+        // ปุ่มเล่นต่อ
+        // ในโหมด AR ปุ่มกลับ/กติกาจะไปอยู่แถวล่าง จึงต้องยกปุ่มชุดนี้ขึ้นเพื่อไม่ให้ทับกัน
+        const arLayout = (gameMode === 'AR' && cameraStarted);
+        let bw = 320, bh = 80, gap = 40, by = arLayout ? 470 : 550;
+        let bx1 = CANVAS_WIDTH/2 - bw - gap/2;
+        let bx2 = CANVAS_WIDTH/2 + gap/2;
+
+        let hov1 = hoverTarget && hoverTarget.id === 'btn_summary_back';
+        drawRoundedRect(bx1, by, bw, bh, 40, hov1 ? '#444' : '#666', '#fff', 3);
+        drawText("กลับไปเลือกหมวกใบอื่น", bx1 + bw/2, by + 50, 26, '#FFF', 'center', 'bold');
+        registerButton('btn_summary_back', bx1, by, bw, bh, () => {
+            currentState = STATE_HATS;
+        });
+
+        let hov2 = hoverTarget && hoverTarget.id === 'btn_summary_mode';
+        drawRoundedRect(bx2, by, bw, bh, 40, hov2 ? '#6b0000' : '#800000', '#d4af37', 3);
+        drawText("เปลี่ยนรูปแบบการเล่น", bx2 + bw/2, by + 50, 26, '#FFF', 'center', 'bold');
+        registerButton('btn_summary_mode', bx2, by, bw, bh, () => {
+            currentState = STATE_MODE_SELECT;
+        });
+    }
+
+    function drawBackButton(targetState) {
+        // โหมด AR เลือกด้วยหัว จึงทำปุ่มให้ใหญ่และอยู่ในระยะที่เอื้อมถึงง่าย
+        const ar = (gameMode === 'AR' && cameraStarted);
+        let bw = ar ? 280 : 200, bh = ar ? 80 : 60;
+        let bx = 40, by = ar ? CANVAS_HEIGHT - bh - 40 : 40;
+        let isHovered = hoverTarget && hoverTarget.id === 'btn_back';
+        drawRoundedRect(bx, by, bw, bh, 30, isHovered ? '#555' : '#777', '#333', 2);
+        drawText("◀ กลับ", bx + bw/2, by + bh/2 + 10, ar ? 34 : 24, '#fff', 'center', 'bold');
+        registerButton('btn_back', bx, by, bw, bh, () => { currentState = targetState; });
+    }
+
+    let cameraStarted = false;
+    let poseInstance = null;
+    let cameraInstance = null;
+
+    function initMediaPipe() {
+        if (cameraStarted) return;
+        cameraStarted = true;
+        
+        statusMsg.style.display = 'block';
+
+        // สร้าง Pose ครั้งเดียวแล้วใช้ซ้ำ ป้องกันการโหลดโมเดลใหม่ทุกครั้งที่สลับโหมด
+        if (!poseInstance) {
+            poseInstance = new Pose({locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
+            }});
+            poseInstance.setOptions({
+                modelComplexity: 1,
+                smoothLandmarks: true,
+                minDetectionConfidence: 0.7,
+                minTrackingConfidence: 0.7
+            });
+            poseInstance.onResults(onPoseResults);
+        }
+
+        if (!cameraInstance) {
+            cameraInstance = new Camera(videoElement, {
+                onFrame: async () => {
+                    // ไม่ต้องประมวลผลถ้าไม่ได้อยู่ในโหมด AR
+                    if (gameMode !== 'AR' || !cameraStarted) return;
+                    await poseInstance.send({image: videoElement});
+                },
+                width: 640,
+                height: 480
+            });
+        }
+
+        cameraInstance.start().then(() => {
+            statusMsg.style.display = 'none';
+        }).catch((err) => {
+            console.error(err);
+            errorOverlay.style.display = 'flex';
+        });
+    }
+
+    // ปิดกล้องให้สนิทเมื่อเลือกโหมดเล่นปกติ
+    // เพื่อไม่ให้มีการ tracking เหลือค้าง และไฟกล้องดับจริง
+    function stopMediaPipe() {
+        cameraStarted = false;
+        isPersonPresent = false;
+        headPos.active = leftHandPos.active = rightHandPos.active = false;
+        cursorX = -100; cursorY = -100;
+        statusMsg.style.display = 'none';
+
+        try {
+            if (cameraInstance) cameraInstance.stop();
+        } catch (e) { /* บางเวอร์ชันไม่มี stop() */ }
+
+        // ปิด track ของกล้องเพื่อให้ไฟกล้องดับ
+        const stream = videoElement.srcObject;
+        if (stream && stream.getTracks) {
+            stream.getTracks().forEach(t => t.stop());
+            videoElement.srcObject = null;
+        }
+        cameraInstance = null; // สร้างใหม่เมื่อกลับเข้าโหมด AR อีกครั้ง
+    }
+
+    function onPoseResults(results) {
+        // กันผลลัพธ์ที่ค้างในคิวมาขยับเคอร์เซอร์ตอนอยู่โหมดเล่นปกติ
+        if (gameMode !== 'AR' || !cameraStarted) {
+            isPersonPresent = false;
+            return;
+        }
+
+        if (results.poseLandmarks) {
+            isPersonPresent = true;
+            let lm = results.poseLandmarks;
+            
+            // Note: Camera is mirrored via CSS scaleX(-1), so x coordinates need to be inverted (1 - x)
+            // Landmark 0: Nose (Head)
+            // Landmark 19: Left Index (Appears on left of screen)
+            // Landmark 20: Right Index (Appears on right of screen)
+            
+            headPos = { x: (1 - lm[0].x) * CANVAS_WIDTH, y: lm[0].y * CANVAS_HEIGHT, active: lm[0].visibility > 0.6 };
+            leftHandPos = { x: (1 - lm[19].x) * CANVAS_WIDTH, y: lm[19].y * CANVAS_HEIGHT, active: lm[19].visibility > 0.6 };
+            rightHandPos = { x: (1 - lm[20].x) * CANVAS_WIDTH, y: lm[20].y * CANVAS_HEIGHT, active: lm[20].visibility > 0.6 };
+
+            // เคอร์เซอร์เมนูใช้ "หัว" (landmark จมูก) เป็นหลัก
+            // เพราะ landmark นิ้วชี้ของ MediaPipe Pose มักมีค่า visibility ต่ำและสั่น
+            // การใช้หัวจึงนิ่งกว่าและตรงกับคำแนะนำบนจอว่า "เลือกโดยการขยับหัว"
+            let px, py;
+            if (headPos.active) {
+                px = headPos.x; py = headPos.y;
+            } else if (rightHandPos.active) {
+                px = rightHandPos.x; py = rightHandPos.y;
+            } else if (leftHandPos.active) {
+                px = leftHandPos.x; py = leftHandPos.y;
+            }
+
+            if (px !== undefined) {
+                // ขยายระยะการขยับ: หัวขยับได้ในกรอบแคบ ถ้าจับคู่ 1:1 จะเอื้อมไปมุมจอไม่ถึง
+                // จึงคูณระยะห่างจากจุดกึ่งกลางให้ไกลขึ้น ปุ่มมุมจอจะเลือกได้ง่ายขึ้นมาก
+                const NEUTRAL_Y = CANVAS_HEIGHT * 0.38; // ตำแหน่งหัวโดยเฉลี่ยเมื่อยืนตรง
+                const GAIN_X = 1.9, GAIN_Y = 2.2;
+                cursorX = Math.max(0, Math.min(CANVAS_WIDTH,
+                    CANVAS_WIDTH/2 + (px - CANVAS_WIDTH/2) * GAIN_X));
+                cursorY = Math.max(0, Math.min(CANVAS_HEIGHT,
+                    CANVAS_HEIGHT/2 + (py - NEUTRAL_Y) * GAIN_Y));
+            }
+
+        } else {
+            isPersonPresent = false;
+        }
+    }
+
+    function gameLoop() {
+        checkHover();
+        drawScene();
+        requestAnimationFrame(gameLoop);
+    }
+
+    window.onload = function() {
+        gameLoop();
+    };
+
+    // แปลงพิกัดเมาส์บนหน้าจอจริง ให้เป็นพิกัดภายใน canvas
+    function toCanvasCoords(e) {
+        const rect = canvas.getBoundingClientRect();
+        return {
+            x: (e.clientX - rect.left) * (canvas.width / rect.width),
+            y: (e.clientY - rect.top) * (canvas.height / rect.height)
+        };
+    }
+
+    canvas.addEventListener('mousemove', (e) => {
+        const p = toCanvasCoords(e);
+        cursorX = p.x;
+        cursorY = p.y;
+
+        // โหมดเล่นปกติ: เลื่อนเมาส์ซ้าย-ขวาเพื่อบังคับรถเข็น
+        if (currentState === STATE_AR_GAME && gameMode === 'NORMAL') {
+            cartX = Math.max(CART_HALF_WIDTH, Math.min(CANVAS_WIDTH - CART_HALF_WIDTH, p.x));
+        }
+    });
+
+    // ปุ่ม "ออกจากภารกิจ" ระหว่างเล่น (ช่วงนี้ไม่ได้ลงทะเบียนปุ่มปกติ จึงเช็กเอง)
+    canvas.addEventListener('click', (e) => {
+        if (currentState !== STATE_AR_GAME) return;
+        const p = toCanvasCoords(e);
+        const r = quitBtnRect;
+        if (p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h) {
+            sfxClick();
+            stopMusic();
+            currentState = STATE_HATS;
+        }
+    });
+
+</script>
+</body>
+</html>
